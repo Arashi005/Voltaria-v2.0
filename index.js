@@ -1,166 +1,223 @@
-process.env.PUPPETEER_SKIP_DOWNLOAD = 'true';
-process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = 'true';
+require('dotenv').config();
 
-const express = require('express');
-const pino = require('pino');
 const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason,
-  Browsers
+    default: makeWASocket,
+    DisconnectReason,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    makeInMemoryStore
 } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
-const config = require('./config');
-const handler = require('./handler');
 
-// Load command handlers
-const commandHandler = require('./handlers/command-handler');
-const messageHandler = require('./handlers/message-handler');
+const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const qrcode = require('qrcode');
+const mongoose = require('mongoose');
+const NodeCache = require('node-cache');
+
+const messageHandler = require('./message');
+const commandHandler = require('./handler/commandHandler');
+const config = require('./config');
+
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-let latestQR = null;
-let isConnected = false;
+app.use(helmet());
+app.use(compression());
 
-// Settings
-const prefix = config.prefix || '§';
-const botName = config.botName || 'Voltaria Nexus';
-const ownerNumber = config.ownerNumber || ['254108720384'];
+app.use(rateLimit({
+    windowMs: 60 * 1000,
+    max: 100
+}));
 
-// Global variables
-global.owner = ownerNumber;
-global.disabledGroups = [];
-global.nsfwDisabledGroups = [];
-global.reportCooldowns = {};
-global.bannedReporters = [];
-global.sudoUsers = [];
-
-// Web server
-app.get('/', async (req, res) => {
-    if (isConnected) {
-        res.send('<h1>✅ Voltaria Bot is Online!</h1>');
-    } else if (latestQR) {
-        const QRCode = require('qrcode');
-        const qrImage = await QRCode.toDataURL(latestQR);
-        res.send(`<img src="${qrImage}" style="width:300px;"/>`);
-    } else {
-        res.send('<h1>🚀 Starting Voltaria Bot...</h1>');
-    }
+const store = makeInMemoryStore({
+    logger: pino().child({
+        level: 'silent',
+        stream: 'store'
+    })
 });
 
-app.get('/health', (req, res) => res.status(200).send('OK'));
-app.listen(PORT, () => console.log(`✅ Web server on port ${PORT}`));
+const msgRetryCounterCache = new NodeCache();
+
+const prefix = config.prefix || '.';
+const botName = config.botName || 'Voltaria Nexus';
+
+let latestQR = null;
+let isConnected = false;
+let reconnecting = false;
+
+global.reportCooldowns = {};
+global.bannedReporters = [];
+
+setInterval(() => {
+    global.reportCooldowns = {};
+}, 1000 * 60 * 60);
+
+async function connectDatabase() {
+    try {
+        if (!config.mongodbUrl) {
+            console.log('⚠️ No MongoDB URL Provided');
+            return;
+        }
+
+        await mongoose.connect(config.mongodbUrl);
+
+        console.log('✅ MongoDB Connected');
+
+    } catch (err) {
+        console.error('❌ MongoDB Connection Error:', err);
+    }
+}
 
 async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState('./session');
+
+    const sessionPath = path.join(__dirname, 'session');
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
         version,
         logger: pino({ level: 'silent' }),
+        printQRInTerminal: true,
         auth: state,
-        browser: Browsers.ubuntu('Chrome'),
-        printQRInTerminal: false,
+        msgRetryCounterCache,
+        browser: ['Voltaria Nexus', 'Chrome', '1.0.0'],
         generateHighQualityLinkPreview: true,
-        patchMessageBeforeSending: (message) => {
-            const requiresPatch = !!(
-                message.buttonsMessage || 
-                message.templateMessage || 
-                message.listMessage
-            );
-            if (requiresPatch) {
-                message = {
-                    viewOnceMessage: {
-                        message: {
-                            messageContextInfo: {
-                                deviceListMetadataVersion: 2,
-                                deviceListMetadata: {},
-                            },
-                            ...message,
-                        },
-                    },
-                };
-            }
-            return message;
-        }
+        syncFullHistory: false,
+        markOnlineOnConnect: true
     });
 
+    store.bind(sock.ev);
+
     sock.ev.on('connection.update', async (update) => {
-        const { connection, qr, lastDisconnect } = update;
+
+        const {
+            connection,
+            lastDisconnect,
+            qr
+        } = update;
 
         if (qr) {
             latestQR = qr;
-            isConnected = false;
-            console.log('📱 QR Code generated!');
-            qrcode.generate(qr, { small: true });
         }
 
         if (connection === 'open') {
             isConnected = true;
-            latestQR = null;
-            console.log('\n✅ Voltaria Bot Connected!');
-            console.log(`📱 Bot: ${sock.user.id.split(':')[0]}`);
-            console.log(`⚡ Prefix: ${prefix}`);
-            console.log(`👑 Owner: ${ownerNumber[0]}\n`);
+            reconnecting = false;
+
+            console.log('✅ Bot Connected Successfully');
         }
 
         if (connection === 'close') {
-            const code = lastDisconnect?.error?.output?.statusCode;
-            if (code !== DisconnectReason.loggedOut) {
-                console.log('🔄 Reconnecting...');
-                setTimeout(startBot, 5000);
+
+            isConnected = false;
+
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+
+            console.log('❌ Connection Closed:', statusCode);
+
+            if (statusCode !== DisconnectReason.loggedOut) {
+
+                if (reconnecting) return;
+
+                reconnecting = true;
+
+                console.log('🔄 Reconnecting in 5 seconds...');
+
+                setTimeout(async () => {
+                    reconnecting = false;
+                    await startBot();
+                }, 5000);
+
             } else {
-                console.log('❌ Logged out. Please delete session folder and restart.');
+                console.log('❌ Logged Out. Delete session folder and scan again.');
             }
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
-    
-    // Handle messages with both old and new handler systems
+
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
+
         if (type !== 'notify') return;
+
         for (const msg of messages) {
-            if (!msg.message || msg.key.fromMe) continue;
-            
-            // Ignore status messages
-            if (msg.key.remoteJid === 'status@broadcast') continue;
-            
+
             try {
-                // Try new handler system first
-                await messageHandler(sock, msg, commandHandler, prefix, botName);
+
+                if (!msg.message) continue;
+                if (msg.key.fromMe) continue;
+                if (msg.key.remoteJid === 'status@broadcast') continue;
+
+                await messageHandler(
+                    sock,
+                    msg,
+                    commandHandler,
+                    prefix,
+                    botName
+                );
+
             } catch (err) {
-                console.error('New handler error:', err.message);
-                // Fallback to old handler
-                try {
-                    await handler.handleMessage(sock, msg);
-                } catch (err2) {
-                    console.error('Old handler error:', err2.message);
-                }
+                console.error('❌ Message Handler Error:', err);
             }
         }
-    });
-
-    // Handle group updates
-    sock.ev.on('group-participants.update', async (update) => {
-        // Handle welcome/goodbye here if needed
-    });
-
-    // Handle presence updates
-    sock.ev.on('presence.update', async (update) => {
-        // Optional: track user presence
     });
 
     return sock;
 }
 
-// Handle process termination
-process.on('SIGINT', async () => {
-    console.log('🛑 Bot shutting down...');
-    process.exit(0);
+app.get('/', async (req, res) => {
+
+    const key = req.query.key;
+
+    if (key !== process.env.ADMIN_KEY) {
+        return res.status(403).send('Forbidden');
+    }
+
+    if (isConnected) {
+        return res.send('✅ Voltaria Nexus Online');
+    }
+
+    if (latestQR) {
+
+        const qrImage = await qrcode.toDataURL(latestQR);
+
+        return res.send(`
+            <html>
+                <head>
+                    <title>Voltaria QR</title>
+                </head>
+                <body style="background:#111;color:white;text-align:center;font-family:sans-serif;">
+                    <h1>Scan QR Code</h1>
+                    <img src="${qrImage}" width="300" />
+                </body>
+            </html>
+        `);
+    }
+
+    res.send('⏳ Starting Bot...');
 });
 
-console.log('\n🚀 Starting Voltaria Bot...\n');
-startBot().catch(console.error);
+app.listen(PORT, () => {
+    console.log(`🌐 Web Server Running On Port ${PORT}`);
+});
+
+process.on('uncaughtException', err => {
+    console.error('❌ Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', err => {
+    console.error('❌ Unhandled Rejection:', err);
+});
+
+(async () => {
+    await connectDatabase();
+    await startBot();
+})();
